@@ -1,5 +1,6 @@
 // DLNA / UPnP AV のコントロールポイント（レンダラー探索と AVTransport 操作）。
 import dgram from 'node:dgram';
+import os from 'node:os';
 
 const AVT = 'urn:schemas-upnp-org:service:AVTransport:1';
 const RC = 'urn:schemas-upnp-org:service:RenderingControl:1';
@@ -15,55 +16,64 @@ const tag = (xml, name) => {
   return m ? xmlUnescape(m[1].trim()) : undefined;
 };
 
-/** SSDP でネットワーク上のレンダラーとミュージックサーバーの description URL を集める */
-export function ssdpSearch(timeoutMs = 2500) {
-  return new Promise((resolve) => {
-    const found = new Set();
-    const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-    const done = () => {
-      try { sock.close(); } catch {}
-      resolve([...found]);
-    };
-    sock.on('error', done);
-    sock.on('message', (msg) => {
-      const m = msg.toString().match(/^location:\s*(\S+)/im);
-      if (m) found.add(m[1]);
+/** SSDP でネットワーク上の UPnP 機器の description URL を集める */
+export function ssdpSearch(timeoutMs = 3000) {
+  // PC に複数のネットワーク（Wi-Fi、有線、仮想アダプターなど）があると、既定の 1 つにしか
+  // 問い合わせが出ず機器を見落とすので、すべての IPv4 アドレスから送る。
+  const addrs = Object.values(os.networkInterfaces()).flat().filter((i) => i.family === 'IPv4' && !i.internal).map((i) => i.address);
+  if (!addrs.length) addrs.push(undefined);
+  const found = new Set();
+  const targets = ['ssdp:all', 'urn:schemas-upnp-org:device:MediaRenderer:1', 'urn:schemas-upnp-org:device:MediaServer:1', AVT];
+  const searchFrom = (address) =>
+    new Promise((resolve) => {
+      const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+      const done = () => {
+        try { sock.close(); } catch {}
+        resolve();
+      };
+      sock.on('error', done);
+      sock.on('message', (msg) => {
+        const m = msg.toString().match(/^location:\s*(\S+)/im);
+        if (m) found.add(m[1]);
+      });
+      sock.bind(0, address, () => {
+        for (const st of targets) {
+          const req = Buffer.from(
+            `M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 2\r\nST: ${st}\r\n\r\n`,
+          );
+          for (let i = 0; i < 2; i++) sock.send(req, 1900, '239.255.255.250', () => {});
+        }
+        setTimeout(done, timeoutMs);
+      });
     });
-    sock.bind(0, () => {
-      for (const st of ['urn:schemas-upnp-org:device:MediaRenderer:1', 'urn:schemas-upnp-org:device:MediaServer:1', AVT]) {
-        const req = Buffer.from(
-          `M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 2\r\nST: ${st}\r\n\r\n`,
-        );
-        for (let i = 0; i < 2; i++) sock.send(req, 1900, '239.255.255.250', () => {});
-      }
-      setTimeout(done, timeoutMs);
-    });
-  });
+  return Promise.all(addrs.map(searchFrom)).then(() => [...found]);
 }
 
-/** description XML を読んで機器情報にする。avt があればレンダラー、cd があればミュージックサーバー。どちらも無ければ null */
+/** description XML を読んで機器情報にする。avt があればレンダラー、cd があればミュージックサーバー、openhome は OpenHome 方式のプレーヤー */
 export async function describe(location) {
   const res = await fetch(location, { signal: AbortSignal.timeout(4000) });
   if (!res.ok) throw new Error(`description 取得失敗 (${res.status})`);
   const xml = await res.text();
   const base = tag(xml, 'URLBase') || location;
   const control = {};
+  const services = [];
   for (const [, svc] of xml.matchAll(/<service>([\s\S]*?)<\/service>/g)) {
     const type = tag(svc, 'serviceType') ?? '';
     const url = tag(svc, 'controlURL');
     if (!url) continue;
+    services.push(type.split(':').at(-2) ?? type);
+    if (type.includes('av-openhome-org')) control.openhome = true;
     if (type.includes(':AVTransport:')) control.avt ??= new URL(url, base).href;
     if (type.includes(':RenderingControl:')) control.rc ??= new URL(url, base).href;
     if (type.includes(':ContentDirectory:')) control.cd ??= new URL(url, base).href;
   }
-  if (!control.avt && !control.cd) return null;
-  return { location, name: tag(xml, 'friendlyName') ?? new URL(location).host, host: new URL(location).hostname, ...control };
+  return { location, services, name: tag(xml, 'friendlyName') ?? new URL(location).host, host: new URL(location).hostname, ...control };
 }
 
 export async function discover(timeoutMs) {
   const locations = await ssdpSearch(timeoutMs);
   const list = await Promise.all(locations.map((l) => describe(l).catch(() => null)));
-  return list.filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
+  return list.filter((d) => d?.services.length).sort((a, b) => a.name.localeCompare(b.name));
 }
 
 async function soap(url, service, action, args = {}) {

@@ -86,6 +86,12 @@
     </form>
   </details></section>
 
+  <section class="card"><details>
+    <summary>見つかった機器（うまく出てこないとき用）</summary>
+    <ul id="devices"></ul>
+    <div class="hint" id="devicesHint"></div>
+  </details></section>
+
   <section class="card" id="searchCard">
     <form id="searchForm" class="row" style="display:flex">
       <input id="q" placeholder="アーティスト・アルバム・曲名で検索" autofocus>
@@ -186,6 +192,12 @@ async function openAlbum(id) {
 function render() {
   const s = state;
   $('loginCard').hidden = s.loggedIn;
+  const kinds = (d) => [d.renderer && '再生先として使用可', d.server && 'ミュージックサーバー', d.openhome && 'OpenHome 方式のプレーヤー（操作不可）']
+    .filter(Boolean).join(' / ') || 'オーディオ機器ではありません';
+  $('devices').replaceChildren(...s.devices.map((d) => el('li', { className: 'item', style: 'cursor:default' },
+    el('div', { className: 'meta' }, el('div', { textContent: `${d.name} — ${kinds(d)}` }),
+      el('div', { className: 's', textContent: `${d.location}  [${d.services.join(', ')}]` })))));
+  $('devicesHint').textContent = s.devices.length ? '' : '機器が 1 台も見つかりません。Windows ファイアウォールで Node.js の「プライベートネットワーク」通信が許可されているか確認し、「再検索」を押してください。';
   const sv = $('server');
   const known = [...sv.options].map((o) => o.value).filter(Boolean).join('|');
   if (known !== s.servers.map((r) => r.location).join('|')) {

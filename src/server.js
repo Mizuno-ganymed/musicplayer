@@ -25,6 +25,7 @@ export async function start({
 
   const qobuz = new Qobuz({ ...config, fetchImpl });
   let renderers = [];
+  let devices = []; // 見つかったすべての UPnP 機器（診断表示用）
   let servers = []; // ミュージックサーバー（ContentDirectory を持つ機器）
   let renderer = null;
   const player = { queue: [], index: -1, state: 'STOPPED', position: 0, duration: 0, volume: null, error: '', notice: '' };
@@ -36,7 +37,11 @@ export async function start({
     const info = renderers.find((r) => r.location === location) ?? (await describe(location));
     if (info?.cd && !servers.some((r) => r.location === info.location)) servers.push(info);
     if (!info?.avt) {
-      throw new Error(info?.cd ? 'ミュージックサーバーとして追加しました（再生先としては使えない機器です）' : 'DLNA レンダラーではありません');
+      throw new Error(
+        info?.cd ? 'ミュージックサーバーとして追加しました（再生先としては使えない機器です）'
+          : info?.openhome ? 'この機器は OpenHome 方式で動作中のため操作できません。機器側で DLNA 方式に切り替えてください'
+            : 'DLNA レンダラーではありません',
+      );
     }
     if (!renderers.some((r) => r.location === info.location)) renderers.push(info);
     renderer = new Renderer(info);
@@ -98,6 +103,7 @@ export async function start({
 
   async function rediscover() {
     const found = await discover().catch(() => []);
+    devices = found;
     // 手動追加・選択中の機器は探索で見つからなくても残す
     const keep = (list, f) => [...f, ...list.filter((r) => !f.some((x) => x.location === r.location))];
     renderers = keep(renderer ? [{ ...renderer }] : [], found.filter((d) => d.avt));
@@ -113,6 +119,9 @@ export async function start({
       formats: FORMATS,
       renderers: renderers.map(({ location, name }) => ({ location, name })),
       servers: servers.map(({ location, name }) => ({ location, name })),
+      devices: devices.map(({ location, name, avt, cd, openhome, services }) => ({
+        location, name, renderer: Boolean(avt), server: Boolean(cd), openhome: Boolean(openhome), services,
+      })),
       renderer: renderer?.location ?? '',
       ...player,
       queue: player.queue.map(({ token, file, ...t }) => t),
