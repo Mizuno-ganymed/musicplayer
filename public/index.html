@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qobuz DLNA Player</title>
+<style>
+  :root { --bg:#12141a; --panel:#1c1f28; --line:#2c3040; --text:#e8eaf0; --sub:#9aa0b4; --accent:#4f8cff; --warn:#ffb454; --err:#ff6b6b; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f5f6f9; --panel:#fff; --line:#dcdfe8; --text:#1c1f28; --sub:#636a80; --accent:#2563eb; --warn:#b45309; --err:#c81e1e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif; padding-bottom:150px; }
+  header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:12px 16px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0 auto 0 0; }
+  main { max-width:860px; margin:0 auto; padding:16px; }
+  input, select, button { font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:7px 10px; min-width:0; }
+  button { cursor:pointer; background:var(--panel); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.4; cursor:default; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .row > input { flex:1 1 180px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:14px; margin:0 0 10px; color:var(--sub); font-weight:600; }
+  .card form { display:grid; gap:8px; }
+  .hint { color:var(--sub); font-size:13px; }
+  ul { list-style:none; margin:0; padding:0; }
+  li.item { display:flex; align-items:center; gap:12px; padding:8px; border-radius:8px; cursor:pointer; }
+  li.item:hover { background:var(--line); }
+  li.item.current { color:var(--accent); }
+  li.item img, li.item .noimg { width:44px; height:44px; border-radius:6px; flex:none; background:var(--line); object-fit:cover; }
+  li.item .meta { flex:1; min-width:0; }
+  li.item .meta div { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  li.item .meta .s { color:var(--sub); font-size:13px; }
+  .badge { font-size:11px; border:1px solid var(--warn); color:var(--warn); border-radius:4px; padding:0 4px; flex:none; }
+  .time { color:var(--sub); font-size:13px; font-variant-numeric:tabular-nums; flex:none; }
+  #bar { position:fixed; left:0; right:0; bottom:0; background:var(--panel); border-top:1px solid var(--line); padding:10px 16px; }
+  #bar .in { max-width:860px; margin:0 auto; display:grid; gap:6px; }
+  #now { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #msg { font-size:13px; }
+  #msg.err { color:var(--err); } #msg.warn { color:var(--warn); }
+  input[type=range] { padding:0; accent-color:var(--accent); }
+  #seek { width:100%; }
+  #bar #vol { width:110px; flex:none; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Qobuz DLNA Player</h1>
+  <select id="renderer" title="再生先"></select>
+  <button id="discover" title="レンダラーを再検索">再検索</button>
+  <select id="quality" title="音質"></select>
+  <button id="logout" hidden>ログアウト</button>
+</header>
+<main>
+  <section class="card" id="loginCard" hidden>
+    <h2>Qobuz にログイン</h2>
+    <form id="loginForm">
+      <div class="row"><input id="appId" placeholder="App ID" autocomplete="off"><input id="appSecret" placeholder="App Secret" type="password" autocomplete="off"></div>
+      <div class="row"><input id="email" placeholder="メールアドレス" type="email" autocomplete="username"><input id="password" placeholder="パスワード" type="password" autocomplete="current-password"></div>
+      <input id="token" placeholder="または user_auth_token を直接入力（任意）" autocomplete="off">
+      <div class="row"><button class="primary">ログイン</button><span class="hint" id="loginHint"></span></div>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>再生先を手動で追加</h2>
+    <form id="manualForm" class="row" style="display:flex">
+      <input id="manual" placeholder="自動検出されない場合: レンダラーの description URL (http://192.168.x.x:port/description.xml)">
+      <button>追加</button>
+    </form>
+  </section>
+
+  <section class="card" id="searchCard">
+    <form id="searchForm" class="row" style="display:flex">
+      <input id="q" placeholder="アーティスト・アルバム・曲名で検索" autofocus>
+      <button class="primary">検索</button>
+    </form>
+  </section>
+
+  <section class="card" id="albumCard" hidden>
+    <h2 id="albumTitle"></h2>
+    <div class="row" style="margin-bottom:8px"><button class="primary" id="playAlbum">アルバムを再生</button><button id="closeAlbum">閉じる</button></div>
+    <ul id="albumTracks"></ul>
+  </section>
+  <section class="card" id="albumsCard" hidden><h2>アルバム</h2><ul id="albums"></ul></section>
+  <section class="card" id="tracksCard" hidden><h2>曲</h2><ul id="tracks"></ul></section>
+  <section class="card" id="queueCard" hidden><h2>再生キュー</h2><ul id="queue"></ul></section>
+</main>
+
+<div id="bar"><div class="in">
+  <div id="now" class="hint">停止中</div>
+  <div id="msg"></div>
+  <div class="row" style="align-items:center">
+    <span class="time" id="pos">0:00</span>
+    <input type="range" id="seek" min="0" max="1" value="0" style="flex:1">
+    <span class="time" id="dur">0:00</span>
+  </div>
+  <div class="row" style="align-items:center">
+    <button id="prev">⏮</button><button id="toggle" class="primary">▶</button><button id="next">⏭</button><button id="stop">⏹</button>
+    <span style="margin-left:auto" class="hint">音量</span><input type="range" id="vol" min="0" max="100">
+  </div>
+</div></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
+const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s) % 60).padStart(2, '0')}`;
+let state = {}, album = null, localError = '', dragging = false, volDragging = false;
+
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error || `エラー (${res.status})`);
+  return json;
+}
+// 操作 → 失敗したら下部に表示 → 状態を更新
+async function act(fn) {
+  localError = '';
+  try { await fn(); } catch (e) { localError = e.message; }
+  await refresh();
+}
+
+function item(t, { sub, onclick, current, right }) {
+  const li = el('li', { className: 'item' + (current ? ' current' : ''), onclick });
+  li.append(t.image ? el('img', { src: t.image, loading: 'lazy', alt: '' }) : el('div', { className: 'noimg' }));
+  li.append(el('div', { className: 'meta' }, el('div', { textContent: t.title }), el('div', { className: 's', textContent: sub })));
+  if (t.hires) li.append(el('span', { className: 'badge', textContent: 'Hi-Res' }));
+  if (right) li.append(el('span', { className: 'time', textContent: right }));
+  return li;
+}
+const play = (tracks, index) => act(() => api('/api/play', { tracks, index }));
+const trackList = (ul, tracks, sub) =>
+  ul.replaceChildren(...tracks.map((t, i) => item(t, { sub: sub(t), right: fmt(t.duration), onclick: () => play(tracks, i) })));
+
+async function openAlbum(id) {
+  await act(async () => {
+    album = await api('/api/album?id=' + encodeURIComponent(id));
+    $('albumTitle').textContent = `${album.title} — ${album.artist}`;
+    trackList($('albumTracks'), album.tracks, (t) => t.artist);
+    $('albumCard').hidden = false;
+    $('albumCard').scrollIntoView({ behavior: 'smooth' });
+  });
+}
+
+function render() {
+  const s = state;
+  $('loginCard').hidden = s.loggedIn;
+  $('searchCard').hidden = !s.loggedIn;
+  $('logout').hidden = !s.loggedIn;
+  $('loginHint').textContent = s.configured ? 'App ID / Secret は保存済みです（空欄のままで可）' : '';
+
+  const sel = $('renderer');
+  if (document.activeElement !== sel) {
+    sel.replaceChildren(el('option', { value: '', textContent: s.renderers.length ? '再生先を選択…' : 'レンダラーが見つかりません' }),
+      ...s.renderers.map((r) => el('option', { value: r.location, textContent: r.name })));
+    sel.value = s.renderer;
+  }
+  const qs = $('quality');
+  if (!qs.options.length) qs.replaceChildren(...Object.entries(s.formats).map(([v, n]) => el('option', { value: v, textContent: n })));
+  if (document.activeElement !== qs) qs.value = s.formatId;
+
+  const cur = s.queue[s.index];
+  $('now').textContent = cur ? `${cur.title} — ${cur.artist}` : '停止中';
+  $('now').className = cur ? '' : 'hint';
+  const err = localError || s.error;
+  $('msg').textContent = err || s.notice;
+  $('msg').className = err ? 'err' : 'warn';
+  $('toggle').textContent = s.state === 'PLAYING' || s.state === 'TRANSITIONING' ? '⏸' : '▶';
+  $('toggle').disabled = !cur;
+  $('prev').disabled = !cur || s.index === 0;
+  $('next').disabled = !cur || s.index >= s.queue.length - 1;
+  $('stop').disabled = !cur;
+  const dur = s.duration || cur?.duration || 0;
+  if (!dragging) { $('seek').max = Math.max(1, dur); $('seek').value = cur ? s.position : 0; $('pos').textContent = fmt(cur ? s.position : 0); }
+  $('dur').textContent = fmt(cur ? dur : 0);
+  $('seek').disabled = !cur;
+  $('vol').disabled = s.volume == null;
+  if (!volDragging && s.volume != null) $('vol').value = s.volume;
+
+  $('queueCard').hidden = !s.queue.length;
+  $('queue').replaceChildren(...s.queue.map((t, i) =>
+    item(t, { sub: `${t.artist} · ${t.album}`, right: fmt(t.duration), current: i === s.index, onclick: () => play(s.queue, i) })));
+}
+
+async function refresh() {
+  try { state = await api('/api/state'); render(); } catch {}
+}
+
+$('loginForm').onsubmit = (e) => { e.preventDefault(); act(async () => {
+  await api('/api/login', Object.fromEntries(['appId', 'appSecret', 'email', 'password', 'token'].map((k) => [k, $(k).value])));
+  $('password').value = $('token').value = $('appSecret').value = '';
+}); };
+$('logout').onclick = () => act(() => api('/api/logout', {}));
+$('searchForm').onsubmit = (e) => { e.preventDefault(); act(async () => {
+  const r = await api('/api/search?q=' + encodeURIComponent($('q').value));
+  $('albumsCard').hidden = !r.albums.length;
+  $('tracksCard').hidden = !r.tracks.length;
+  $('albums').replaceChildren(...r.albums.map((a) => item(a, { sub: a.artist, right: `${a.tracksCount}曲`, onclick: () => openAlbum(a.id) })));
+  trackList($('tracks'), r.tracks, (t) => `${t.artist} · ${t.album}`);
+  if (!r.albums.length && !r.tracks.length) localError = '見つかりませんでした';
+}); };
+$('playAlbum').onclick = () => album && play(album.tracks, 0);
+$('closeAlbum').onclick = () => { $('albumCard').hidden = true; };
+$('renderer').onchange = (e) => e.target.value && act(() => api('/api/renderer', { location: e.target.value }));
+$('discover').onclick = async (e) => { e.target.disabled = true; await act(() => api('/api/discover', {})); e.target.disabled = false; };
+$('manualForm').onsubmit = (e) => { e.preventDefault(); act(async () => { await api('/api/renderer', { location: $('manual').value.trim() }); $('manual').value = ''; }); };
+$('quality').onchange = (e) => act(() => api('/api/quality', { formatId: Number(e.target.value) }));
+const control = (action, value) => act(() => api('/api/control', { action, value }));
+$('toggle').onclick = () => control(state.state === 'PLAYING' || state.state === 'TRANSITIONING' ? 'pause' : 'resume');
+$('prev').onclick = () => control('prev');
+$('next').onclick = () => control('next');
+$('stop').onclick = () => control('stop');
+$('seek').oninput = (e) => { dragging = true; $('pos').textContent = fmt(Number(e.target.value)); };
+$('seek').onchange = async (e) => { await control('seek', Number(e.target.value)); dragging = false; };
+$('vol').oninput = () => { volDragging = true; };
+$('vol').onchange = async (e) => { await control('volume', Number(e.target.value)); volDragging = false; };
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

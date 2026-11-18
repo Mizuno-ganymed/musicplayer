@@ -1,0 +1,12 @@
+{
+  "name": "qobuz-dlna-player",
+  "version": "0.1.0",
+  "description": "Qobuz の音楽を DLNA レンダラーへ送るシンプルなプレイヤー",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  }
+}
