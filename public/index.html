@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Qobuz DLNA Player</title>
+<title>DLNA Music Player</title>
 <style>
   :root { --bg:#12141a; --panel:#1c1f28; --line:#2c3040; --text:#e8eaf0; --sub:#9aa0b4; --accent:#4f8cff; --warn:#ffb454; --err:#ff6b6b; }
   @media (prefers-color-scheme: light) {
@@ -42,35 +42,49 @@
   input[type=range] { padding:0; accent-color:var(--accent); }
   #seek { width:100%; }
   #bar #vol { width:110px; flex:none; }
+  .crumbs { display:flex; flex-wrap:wrap; gap:4px; align-items:center; margin:10px 0 6px; font-size:13px; }
+  .crumbs button { padding:2px 8px; }
+  .folder { display:grid; place-items:center; font-size:20px; }
+  details > summary { cursor:pointer; color:var(--sub); font-size:14px; font-weight:600; }
+  details[open] > summary { margin-bottom:10px; }
   [hidden] { display:none !important; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Qobuz DLNA Player</h1>
+  <h1>DLNA Music Player</h1>
   <select id="renderer" title="再生先"></select>
   <button id="discover" title="レンダラーを再検索">再検索</button>
   <select id="quality" title="音質"></select>
   <button id="logout" hidden>ログアウト</button>
 </header>
 <main>
-  <section class="card" id="loginCard" hidden>
-    <h2>Qobuz にログイン</h2>
+  <section class="card" id="libraryCard">
+    <h2>ミュージックサーバー</h2>
+    <select id="server" style="width:100%"></select>
+    <div class="crumbs" id="crumbs"></div>
+    <div class="row" id="folderActions" hidden style="margin-bottom:8px"><button class="primary" id="playFolder">このフォルダを再生</button></div>
+    <ul id="library"></ul>
+    <div class="hint" id="libraryHint"></div>
+  </section>
+
+  <section class="card">
+    <h2>機器を手動で追加</h2>
+    <form id="manualForm" class="row" style="display:flex">
+      <input id="manual" placeholder="自動検出されない場合: 機器の description URL (http://192.168.x.x:port/description.xml)">
+      <button>追加</button>
+    </form>
+  </section>
+
+  <section class="card" id="loginCard" hidden><details>
+    <summary>Qobuz を使う（任意・App ID が必要）</summary>
     <form id="loginForm">
       <div class="row"><input id="appId" placeholder="App ID" autocomplete="off"><input id="appSecret" placeholder="App Secret" type="password" autocomplete="off"></div>
       <div class="row"><input id="email" placeholder="メールアドレス" type="email" autocomplete="username"><input id="password" placeholder="パスワード" type="password" autocomplete="current-password"></div>
       <input id="token" placeholder="または user_auth_token を直接入力（任意）" autocomplete="off">
       <div class="row"><button class="primary">ログイン</button><span class="hint" id="loginHint"></span></div>
     </form>
-  </section>
-
-  <section class="card">
-    <h2>再生先を手動で追加</h2>
-    <form id="manualForm" class="row" style="display:flex">
-      <input id="manual" placeholder="自動検出されない場合: レンダラーの description URL (http://192.168.x.x:port/description.xml)">
-      <button>追加</button>
-    </form>
-  </section>
+  </details></section>
 
   <section class="card" id="searchCard">
     <form id="searchForm" class="row" style="display:flex">
@@ -122,9 +136,9 @@ async function act(fn) {
   await refresh();
 }
 
-function item(t, { sub, onclick, current, right }) {
+function item(t, { sub, onclick, current, right, folder }) {
   const li = el('li', { className: 'item' + (current ? ' current' : ''), onclick });
-  li.append(t.image ? el('img', { src: t.image, loading: 'lazy', alt: '' }) : el('div', { className: 'noimg' }));
+  li.append(folder && !t.image ? el('div', { className: 'noimg folder', textContent: '📁' }) : t.image ? el('img', { src: t.image, loading: 'lazy', alt: '' }) : el('div', { className: 'noimg' }));
   li.append(el('div', { className: 'meta' }, el('div', { textContent: t.title }), el('div', { className: 's', textContent: sub })));
   if (t.hires) li.append(el('span', { className: 'badge', textContent: 'Hi-Res' }));
   if (right) li.append(el('span', { className: 'time', textContent: right }));
@@ -133,6 +147,31 @@ function item(t, { sub, onclick, current, right }) {
 const play = (tracks, index) => act(() => api('/api/play', { tracks, index }));
 const trackList = (ul, tracks, sub) =>
   ul.replaceChildren(...tracks.map((t, i) => item(t, { sub: sub(t), right: fmt(t.duration), onclick: () => play(tracks, i) })));
+
+// --- ミュージックサーバーの閲覧 ---
+let path = [], folder = { containers: [], tracks: [] }, browsing = 0;
+async function openFolder(newPath) {
+  const server = $('server').value;
+  if (!server) return;
+  const seq = ++browsing;
+  $('libraryHint').textContent = '読み込み中…';
+  await act(async () => {
+    const id = newPath.length ? newPath.at(-1).id : '0';
+    const r = await api(`/api/browse?server=${encodeURIComponent(server)}&id=${encodeURIComponent(id)}`);
+    if (seq !== browsing) return;
+    path = newPath; folder = r;
+  });
+  if (seq === browsing) renderLibrary();
+}
+function renderLibrary() {
+  $('crumbs').replaceChildren(el('button', { textContent: 'トップ', onclick: () => openFolder([]) }),
+    ...path.flatMap((p, i) => ['›', el('button', { textContent: p.title, onclick: () => openFolder(path.slice(0, i + 1)) })]));
+  $('folderActions').hidden = !folder.tracks.length;
+  $('library').replaceChildren(
+    ...folder.containers.map((c) => item(c, { sub: '', folder: true, onclick: () => openFolder([...path, { id: c.id, title: c.title }]) })),
+    ...folder.tracks.map((t, i) => item(t, { sub: [t.artist, t.album].filter(Boolean).join(' · '), right: t.duration ? fmt(t.duration) : '', onclick: () => play(folder.tracks, i) })));
+  $('libraryHint').textContent = folder.containers.length || folder.tracks.length ? '' : '（空のフォルダです）';
+}
 
 async function openAlbum(id) {
   await act(async () => {
@@ -147,6 +186,15 @@ async function openAlbum(id) {
 function render() {
   const s = state;
   $('loginCard').hidden = s.loggedIn;
+  const sv = $('server');
+  const known = [...sv.options].map((o) => o.value).filter(Boolean).join('|');
+  if (known !== s.servers.map((r) => r.location).join('|')) {
+    const prev = sv.value || localStorage.getItem('server') || '';
+    sv.replaceChildren(el('option', { value: '', textContent: s.servers.length ? 'サーバーを選択…' : 'サーバーが見つかりません（右上の「再検索」）' }),
+      ...s.servers.map((r) => el('option', { value: r.location, textContent: r.name })));
+    sv.value = s.servers.some((r) => r.location === prev) ? prev : s.servers.length === 1 ? s.servers[0].location : '';
+    if (sv.value && sv.value !== sv.dataset.opened) { sv.dataset.opened = sv.value; openFolder([]); }
+  }
   $('searchCard').hidden = !s.loggedIn;
   $('logout').hidden = !s.loggedIn;
   $('loginHint').textContent = s.configured ? 'App ID / Secret は保存済みです（空欄のままで可）' : '';
@@ -181,7 +229,7 @@ function render() {
 
   $('queueCard').hidden = !s.queue.length;
   $('queue').replaceChildren(...s.queue.map((t, i) =>
-    item(t, { sub: `${t.artist} · ${t.album}`, right: fmt(t.duration), current: i === s.index, onclick: () => play(s.queue, i) })));
+    item(t, { sub: [t.artist, t.album].filter(Boolean).join(' · '), right: fmt(t.duration), current: i === s.index, onclick: () => play(s.queue, i) })));
 }
 
 async function refresh() {
@@ -201,6 +249,8 @@ $('searchForm').onsubmit = (e) => { e.preventDefault(); act(async () => {
   trackList($('tracks'), r.tracks, (t) => `${t.artist} · ${t.album}`);
   if (!r.albums.length && !r.tracks.length) localError = '見つかりませんでした';
 }); };
+$('server').onchange = (e) => { localStorage.setItem('server', e.target.value); e.target.dataset.opened = e.target.value; folder = { containers: [], tracks: [] }; path = []; renderLibrary(); openFolder([]); };
+$('playFolder').onclick = () => folder.tracks.length && play(folder.tracks, 0);
 $('playAlbum').onclick = () => album && play(album.tracks, 0);
 $('closeAlbum').onclick = () => { $('albumCard').hidden = true; };
 $('renderer').onchange = (e) => e.target.value && act(() => api('/api/renderer', { location: e.target.value }));

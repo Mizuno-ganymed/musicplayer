@@ -3,6 +3,7 @@ import dgram from 'node:dgram';
 
 const AVT = 'urn:schemas-upnp-org:service:AVTransport:1';
 const RC = 'urn:schemas-upnp-org:service:RenderingControl:1';
+const CD = 'urn:schemas-upnp-org:service:ContentDirectory:1';
 export const DLNA_FEATURES = 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000';
 
 export const xmlEscape = (s) =>
@@ -14,7 +15,7 @@ const tag = (xml, name) => {
   return m ? xmlUnescape(m[1].trim()) : undefined;
 };
 
-/** SSDP でネットワーク上のレンダラーの description URL を集める */
+/** SSDP でネットワーク上のレンダラーとミュージックサーバーの description URL を集める */
 export function ssdpSearch(timeoutMs = 2500) {
   return new Promise((resolve) => {
     const found = new Set();
@@ -29,7 +30,7 @@ export function ssdpSearch(timeoutMs = 2500) {
       if (m) found.add(m[1]);
     });
     sock.bind(0, () => {
-      for (const st of ['urn:schemas-upnp-org:device:MediaRenderer:1', AVT]) {
+      for (const st of ['urn:schemas-upnp-org:device:MediaRenderer:1', 'urn:schemas-upnp-org:device:MediaServer:1', AVT]) {
         const req = Buffer.from(
           `M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 2\r\nST: ${st}\r\n\r\n`,
         );
@@ -40,7 +41,7 @@ export function ssdpSearch(timeoutMs = 2500) {
   });
 }
 
-/** description XML を読んでレンダラー情報にする。AVTransport が無ければ null */
+/** description XML を読んで機器情報にする。avt があればレンダラー、cd があればミュージックサーバー。どちらも無ければ null */
 export async function describe(location) {
   const res = await fetch(location, { signal: AbortSignal.timeout(4000) });
   if (!res.ok) throw new Error(`description 取得失敗 (${res.status})`);
@@ -53,8 +54,9 @@ export async function describe(location) {
     if (!url) continue;
     if (type.includes(':AVTransport:')) control.avt ??= new URL(url, base).href;
     if (type.includes(':RenderingControl:')) control.rc ??= new URL(url, base).href;
+    if (type.includes(':ContentDirectory:')) control.cd ??= new URL(url, base).href;
   }
-  if (!control.avt) return null;
+  if (!control.avt && !control.cd) return null;
   return { location, name: tag(xml, 'friendlyName') ?? new URL(location).host, host: new URL(location).hostname, ...control };
 }
 
@@ -83,6 +85,57 @@ async function soap(url, service, action, args = {}) {
     throw new Error(`レンダラーが ${action} を拒否しました: ${detail}`);
   }
   return text;
+}
+
+const attr = (attrs, name) => {
+  const m = attrs.match(new RegExp(`(?:^|\\s)${name}="([^"]*)"`));
+  return m ? xmlUnescape(m[1]) : '';
+};
+
+/** ContentDirectory の Browse 結果（DIDL-Lite）をフォルダと曲に分ける */
+export function parseDidl(xml) {
+  const containers = [];
+  const tracks = [];
+  for (const [, attrs, inner] of xml.matchAll(/<container\b([^>]*)>([\s\S]*?)<\/container>/g)) {
+    containers.push({ id: attr(attrs, 'id'), title: tag(inner, 'title') ?? '', image: tag(inner, 'albumArtURI') ?? '' });
+  }
+  for (const [, attrs, inner] of xml.matchAll(/<item\b([^>]*)>([\s\S]*?)<\/item>/g)) {
+    if (!(tag(inner, 'class') ?? '').startsWith('object.item.audioItem')) continue;
+    // 複数の <res> のうち、HTTP で取れる音声を選ぶ（先頭が原本であることが多い）
+    const res = [...inner.matchAll(/<res\b([^>]*)>([\s\S]*?)<\/res>/g)]
+      .map(([, a, u]) => ({ info: attr(a, 'protocolInfo').split(':'), duration: attr(a, 'duration'), url: xmlUnescape(u.trim()) }))
+      .find((r) => r.info[0] === 'http-get' && (r.info[2] ?? '').startsWith('audio/'));
+    if (!res) continue;
+    tracks.push({
+      id: attr(attrs, 'id'),
+      title: tag(inner, 'title') ?? '',
+      artist: tag(inner, 'artist') ?? tag(inner, 'creator') ?? '',
+      album: tag(inner, 'album') ?? '',
+      image: tag(inner, 'albumArtURI') ?? '',
+      duration: parseTime(res.duration),
+      url: res.url,
+      mime: res.info[2],
+    });
+  }
+  return { containers, tracks };
+}
+
+/** ミュージックサーバーのフォルダ 1 階層分を取得する */
+export async function browse(cdUrl, objectId = '0') {
+  const out = { containers: [], tracks: [] };
+  for (let start = 0; start < 5000; ) {
+    const x = await soap(cdUrl, CD, 'Browse', {
+      ObjectID: objectId, BrowseFlag: 'BrowseDirectChildren', Filter: '*',
+      StartingIndex: start, RequestedCount: 200, SortCriteria: '',
+    });
+    const page = parseDidl(tag(x, 'Result') ?? '');
+    out.containers.push(...page.containers);
+    out.tracks.push(...page.tracks);
+    const returned = Number(tag(x, 'NumberReturned')) || 0;
+    start += returned;
+    if (!returned || start >= (Number(tag(x, 'TotalMatches')) || 0)) break;
+  }
+  return out;
 }
 
 export function didl({ url, mime, title, artist, album, image, duration }) {

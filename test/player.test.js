@@ -35,6 +35,11 @@ test('時間と DIDL の整形', () => {
   assert.match(xml, /b=1&amp;c=2/);
 });
 
+const LIBRARY = `<DIDL-Lite><container id="64" parentID="0"><dc:title>Jazz &amp; Blues</dc:title><upnp:class>object.container</upnp:class></container>
+<item id="t1"><dc:title>Local Song</dc:title><upnp:artist>Someone</upnp:artist><upnp:album>Disc</upnp:album><upnp:class>object.item.audioItem.musicTrack</upnp:class>
+<res protocolInfo="http-get:*:audio/x-flac:DLNA.ORG_OP=01" duration="0:04:05.000">http://10.0.0.5:9000/disk/1.flac?a=1&amp;b=2</res></item>
+<item id="p1"><dc:title>Photo</dc:title><upnp:class>object.item.imageItem.photo</upnp:class><res protocolInfo="http-get:*:image/jpeg:*">http://10.0.0.5/1.jpg</res></item></DIDL-Lite>`;
+
 test('検索して再生し、曲が終わると次の曲を送る', async () => {
   // --- 偽レンダラー ---
   const actions = [];
@@ -44,6 +49,7 @@ test('検索して再生し、曲が終わると次の曲を送る', async () =>
       return res.end(`<root><device><friendlyName>Fake &amp; Renderer</friendlyName><serviceList>
         <service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><controlURL>/ctl/avt</controlURL></service>
         <service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType><controlURL>/ctl/rc</controlURL></service>
+        <service><serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType><controlURL>/ctl/cd</controlURL></service>
       </serviceList></device></root>`);
     }
     const body = await readBody(req);
@@ -54,6 +60,7 @@ test('検索して再生し、曲が終わると次の曲を送る', async () =>
       GetTransportInfo: `<CurrentTransportState>${transport}</CurrentTransportState>`,
       GetPositionInfo: `<TrackDuration>0:03:00</TrackDuration><RelTime>0:00:42</RelTime>`,
       GetVolume: `<CurrentVolume>30</CurrentVolume>`,
+      Browse: `<Result>${LIBRARY.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</Result><NumberReturned>3</NumberReturned><TotalMatches>3</TotalMatches>`,
     }[action] ?? '';
     res.end(`<s:Envelope><s:Body><u:${action}Response>${out}</u:${action}Response></s:Body></s:Envelope>`);
   });
@@ -137,6 +144,20 @@ test('検索して再生し、曲が終わると次の曲を送る', async () =>
     st = await get('/api/state');
     assert.equal(st.index, 1);
     assert.match(actions.at(-2).body, /Song 2/);
+
+    // ミュージックサーバーの閲覧と、その曲の再生（URL はそのままレンダラーへ渡る）
+    assert.equal(st.servers[0].name, 'Fake & Renderer');
+    const lib = await get(`/api/browse?server=${encodeURIComponent(rendererUrl)}&id=0`);
+    assert.deepEqual(lib.containers, [{ id: '64', title: 'Jazz & Blues', image: '' }]);
+    assert.equal(lib.tracks.length, 1);
+    assert.deepEqual(
+      { ...lib.tracks[0] },
+      { id: 't1', title: 'Local Song', artist: 'Someone', album: 'Disc', image: '', duration: 245, url: 'http://10.0.0.5:9000/disk/1.flac?a=1&b=2', mime: 'audio/x-flac' },
+    );
+    assert.equal((await post('/api/play', { tracks: lib.tracks })).status, 200);
+    assert.match(actions.at(-2).body, /<CurrentURI>http:\/\/10\.0\.0\.5:9000\/disk\/1\.flac\?a=1&amp;b=2<\/CurrentURI>/);
+    assert.match(actions.at(-2).body, /audio\/x-flac/);
+    assert.equal((await post('/api/play', { tracks: [{ ...lib.tracks[0], url: 'file:///etc/passwd' }] })).status, 400);
 
     await post('/api/control', { action: 'volume', value: 55 });
     assert.match(actions.at(-1).body, /<DesiredVolume>55<\/DesiredVolume>/);

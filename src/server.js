@@ -5,7 +5,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { Qobuz, FORMATS } from './qobuz.js';
-import { Renderer, discover, describe, localAddressFor, DLNA_FEATURES } from './dlna.js';
+import { Renderer, discover, describe, browse, localAddressFor, DLNA_FEATURES } from './dlna.js';
 
 const INDEX_HTML = fileURLToPath(new URL('../public/index.html', import.meta.url));
 const isLoopback = (addr = '') => addr === '::1' || addr.startsWith('127.') || addr.startsWith('::ffff:127.');
@@ -25,6 +25,7 @@ export async function start({
 
   const qobuz = new Qobuz({ ...config, fetchImpl });
   let renderers = [];
+  let servers = []; // ミュージックサーバー（ContentDirectory を持つ機器）
   let renderer = null;
   const player = { queue: [], index: -1, state: 'STOPPED', position: 0, duration: 0, volume: null, error: '', notice: '' };
   const tokens = new Map(); // ストリーム URL のトークン → キューの曲
@@ -33,7 +34,10 @@ export async function start({
 
   async function selectRenderer(location) {
     const info = renderers.find((r) => r.location === location) ?? (await describe(location));
-    if (!info) throw new Error('AVTransport に対応した DLNA レンダラーではありません');
+    if (info?.cd && !servers.some((r) => r.location === info.location)) servers.push(info);
+    if (!info?.avt) {
+      throw new Error(info?.cd ? 'ミュージックサーバーとして追加しました（再生先としては使えない機器です）' : 'DLNA レンダラーではありません');
+    }
     if (!renderers.some((r) => r.location === info.location)) renderers.push(info);
     renderer = new Renderer(info);
     config.rendererLocation = info.location;
@@ -58,11 +62,17 @@ export async function start({
       player.index = i;
       player.error = '';
       sawPlaying = false;
-      const file = await resolveFile(item);
-      player.notice = file.sample ? '試聴版（30秒）のみ再生できる曲です。契約内容を確認してください。' : '';
-      const ip = await localAddressFor(renderer.host);
-      const ext = file.mime.includes('mpeg') ? 'mp3' : 'flac';
-      await renderer.load({ ...item, url: `http://${ip}:${port}/stream/${item.token}.${ext}`, mime: file.mime });
+      player.notice = '';
+      if (item.url) {
+        // ミュージックサーバーの曲: レンダラーがサーバーから直接取りに行く
+        await renderer.load(item);
+      } else {
+        const file = await resolveFile(item);
+        if (file.sample) player.notice = '試聴版（30秒）のみ再生できる曲です。契約内容を確認してください。';
+        const ip = await localAddressFor(renderer.host);
+        const ext = file.mime.includes('mpeg') ? 'mp3' : 'flac';
+        await renderer.load({ ...item, url: `http://${ip}:${port}/stream/${item.token}.${ext}`, mime: file.mime });
+      }
       player.state = 'TRANSITIONING';
     } finally {
       busy = false;
@@ -86,6 +96,14 @@ export async function start({
     }
   }, 1000);
 
+  async function rediscover() {
+    const found = await discover().catch(() => []);
+    // 手動追加・選択中の機器は探索で見つからなくても残す
+    const keep = (list, f) => [...f, ...list.filter((r) => !f.some((x) => x.location === r.location))];
+    renderers = keep(renderer ? [{ ...renderer }] : [], found.filter((d) => d.avt));
+    servers = keep(servers, found.filter((d) => d.cd));
+  }
+
   const api = {
     'GET /api/state': () => ({
       configured: Boolean(config.appId && config.appSecret),
@@ -94,6 +112,7 @@ export async function start({
       formatId: config.formatId,
       formats: FORMATS,
       renderers: renderers.map(({ location, name }) => ({ location, name })),
+      servers: servers.map(({ location, name }) => ({ location, name })),
       renderer: renderer?.location ?? '',
       ...player,
       queue: player.queue.map(({ token, file, ...t }) => t),
@@ -118,10 +137,12 @@ export async function start({
     'GET /api/search': (_, q) => qobuz.search(str(q.get('q'), 200)),
     'GET /api/album': (_, q) => qobuz.album(str(q.get('id'), 100)),
     'POST /api/discover': async () => {
-      const found = await discover();
-      // 手動追加・選択中のレンダラーは探索で見つからなくても残す
-      if (renderer && !found.some((r) => r.location === renderer.location)) found.push({ ...renderer });
-      renderers = found;
+      await rediscover();
+    },
+    'GET /api/browse': (_, q) => {
+      const server = servers.find((s) => s.location === q.get('server'));
+      if (!server) throw new Error('ミュージックサーバーが見つかりません。再検索してください');
+      return browse(server.cd, str(q.get('id') || '0', 2000));
     },
     'POST /api/renderer': ({ location }) => selectRenderer(new URL(str(location)).href),
     'POST /api/quality': async ({ formatId }) => {
@@ -137,6 +158,12 @@ export async function start({
           id: str(t.id, 40), title: str(t.title), artist: str(t.artist), album: str(t.album),
           image: str(t.image), duration: Number(t.duration) || 0, token: randomBytes(12).toString('hex'),
         };
+        if (t.url) {
+          const u = new URL(str(t.url, 2000));
+          if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('再生できない URL です');
+          item.url = u.href;
+          item.mime = /^audio\/[\w.+-]+$/.test(t.mime) ? t.mime : 'audio/mpeg';
+        }
         tokens.set(item.token, item);
         return item;
       });
@@ -162,7 +189,7 @@ export async function start({
 
   async function handleStream(req, res, token) {
     const item = tokens.get(token);
-    if (!item) return res.writeHead(404).end();
+    if (!item || item.url) return res.writeHead(404).end();
     const file = await resolveFile(item);
     const ac = new AbortController();
     res.on('close', () => ac.abort());
@@ -220,7 +247,7 @@ export async function start({
 
   // 前回のレンダラーを復元しつつ、ネットワークを探索しておく
   (async () => {
-    renderers = await discover().catch(() => []);
+    await rediscover();
     if (config.rendererLocation) await selectRenderer(config.rendererLocation).catch(() => {});
   })();
 
@@ -229,5 +256,5 @@ export async function start({
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const { port } = await start();
-  console.log(`Qobuz DLNA Player: http://localhost:${port}`);
+  console.log(`DLNA Music Player: http://localhost:${port}`);
 }
